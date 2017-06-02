@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+#### This script provides an install for all pre-requistes for Ambari 2.5 on CentOS 7.x 
+#
+# source at http://lsnredmine.lausanne.ch/projects/data/repository/entry/ambari-install/ambari-install
+# source at http://github.com/autodomotalus/ambari-prerequisites
+#
+####
+
+
+### java variables
+java_provider="oracle"	
+java_version="8"
+
+
+### Ambari url / agent / server variables
+#install_ambari_agent="${install_ambari_agent:-true}"
+#install_ambari_server="${install_ambari_server:-false}"
+#ambari_server="localhost"
+ambari_version="2.5.0.3"
+ambari_version_major="$(echo ${ambari_version} | awk '{print substr ($0, 0, 2)}')x"
+ambari_server_custom_script="${ambari_server_custom_script:-/bin/true}"
+ambari_repo_baseurl="${ambari_repo_baseurl:-http://public-repo-1.hortonworks.com/ambari}"
+
+
+### iptables variable
+iptables_disable="${iptables_disable:-true}"
+
+
+### IP address from host 1 and host 2
+ip_address_host1="10.0.32.226"
+ip_address_host2="10.0.32.225"
+
+
+### Platform detection
+lsb_dist=''
+if [ -r /etc/centos-release ]; then
+    lsb_dist="centos"
+    lsb_dist_release=$(awk '{print $(NF-1)}' /etc/centos-release | cut -d "." -f1)
+elif [ -r /etc/redhat-release ]; then	
+    lsb_dist="centos"
+    lsb_dist_release=$(awk '{print $(NF-1)}' /etc/redhat-release | cut -d "." -f1)
+elif [ -r /etc/os-release ] && [ $(awk '$1=="ID" {gsub("\"", ""); print $2}' FS='=' /etc/os-release) == "amzn" ]; then
+    lsb_dist="centos"
+    lsb_dist_release=6
+fi
+lsb_dist="$(echo "${lsb_dist}" | tr '[:upper:]' '[:lower:]')"
+
+
+### Check firewall
+check_firewall() {
+	type_firewall=$(yum list | egrep firewalld)
+	if [ -n "${type_firewall}" ]; then
+    	ver_firewall="firewalld"
+	else
+    	ver_firewall="iptables"
+	fi
+ver_firewall="$(echo "${ver_firewall}" | tr '[:upper:]' '[:lower:]')"
+}
+
+
+### Get hostname from host1 & host2 
+hostname_host1=host $ip_address_host1 | awk '{print $NF}' 
+hostname_host2=host $ip_address_host2 | awk '{print $NF}' 
+
+
+### Check DNS and NSCD
+## Edit host file
+	
+printf "${ip_address_host1} ${hostname_host1}" >> /etc/host
+printf "${ip_address_host2} ${hostname_host2}" >> /etc/host
+
+
+### Edit the Network Configuration File
+current_ip_address=$(ip route get 8.8.8.8 | awk '/8.8.8.8/ {print $NF}')
+if [$current_ip_address=ip_address_host1] then
+	printf  "NETWORKING=yes\nHOSTNAME=${hostname_host1} >>/etc/sysconfig/network
+elif
+	printf  "NETWORKING=yes\nHOSTNAME=${hostname_host2} >>/etc/sysconfig/network
+fi 
+
+
+### Check Java and install Java 8 (Oracle/OpenJDK)
+java_version=$(java -version 2>&1 | grep -i version | sed 's/.*version ".*\.\(.*\)\..*"/\1/; 1q')
+
+if [-z "${java_version}" ]; then
+	printf "## Java is not installed on your machine"
+
+	## Installing Java  
+	if [ "${java_provider}" != 'oracle' ]; then
+		printf "## installing java\n"
+	    yum install -q -y java-1.${java_version}.0-openjdk-devel
+	    mkdir -p /usr/java
+	    ln -sf /etc/alternatives/java_sdk /usr/java/default
+	    JAVA_HOME='/usr/java/default'
+	fi
+fi
+
+
+### Prefpare the environnement
+
+# 1. Installing base packages
+# 2. Fixing sudo to not requiretty
+# 3. Disable SELinux
+# 4. Temporarily disable iptables
+# 5. Enable NTP on the Cluster and on the Browser Host
+# 6. Check the umask value
+
+
+printf "Info: Installing base packages\n"
+yum install -y -q curl openssl zlib wget unzip openssh-clients tar scp
+
+printf "Info: Fixing sudo to not requiretty\n"
+printf 'Defaults !requiretty\n' > /etc/sudoers.d/888-dont-requiretty
+
+printf "Info: Disable SELinux\n"
+setenforce 0 || true
+sed -i 's/\(^[^#]*\)SELINUX=enforcing/\1SELINUX=disabled/' /etc/selinux/config
+sed -i 's/\(^[^#]*\)SELINUX=permissive/\1SELINUX=disabled/' /etc/selinux/config
+
+printf "Info: Temporarily disable iptables\n"
+if [ "${iptables_disable}" = true ]; then
+    check_firewall
+    case "${ver_firewall}" in
+        firewalld)
+            printf "### Disabling firewalld\n"
+            systemctl disable firewalld || true
+            systemctl stop firewalld || true
+        ;;
+        iptables)
+            printf "### Info: Disabling iptables\n"
+            chkconfig iptables off || true
+            service iptables stop || true
+            chkconfig ip6tables off || true
+            service ip6tables stop || true
+         ;;
+    esac
+fi
+
+
+### Enable NTP on the Cluster and on the Browser Host (already enable on CentOS 7 VDL )
+#printf "Info: Syncing time via ntpd\n"
+#ntpd -qg || true
+#chkconfig ntpd on || true
+#service ntpd restart || true
+
+### Check the umask value (if user is root umask is set to 0022)
+if ["$(umask)" -ge 0022 -a "$(umask)" -le 0027 ]
+	printf "Info: umask is correctly set\n"
+elif
+	printf "Info: umask set to 0022"
+	umask 0022
+fi
+
+
+### Set Up Password-less SSH
+username="soi_0474"
+sshkey_filename="sshkey"
+sshpath="$HOME/.ssh"
+ssh-keygen  -f /$sshpath/${sshkey_filename} -q   
+
+
+# Copy the SSH Public Key (id_rsa.pub) to the root account on your target hosts.
+cat "$sshpath/$sshkey_filename.pub" | ssh "$ip_address_host2" -l "$username" '[ -d .ssh ] || mkdir .ssh; cat >> .ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
+
+
+
+ 
+#### Amabri baseurl for the repo
+ambari_repo_baseurl="${ambari_repo_baseurl:-http://public-repo-1.hortonworks.com/ambari}"
+
+### Amabri repo 
+
+# http://public-repo-1.hortonworks.com/ambari/centos7/2.x/updates/2.5.0.3/ambari.repo -O /etc/yum.repos.d/ambari.repo
+ambari_repo="${ambari_repo:-${ambari_repo_baseurl}/${lsb_dist}${lsb_dist_release}/${ambari_version_major}/updates/${ambari_version}/ambari.repo}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
